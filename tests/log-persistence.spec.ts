@@ -27,7 +27,12 @@ describe('persistent log sink', () => {
     const lines = readPersistentLog(logFile)
     expect(lines).toHaveLength(1)
     const entry = JSON.parse(lines[0]!) as { detail: string }
-    expect(entry.detail).toContain('~/.dsh/profiles/web')
+    // The redaction folds the home prefix to `~` and leaves the rest of the
+    // path exactly as the machine writes it — a log pasted into an issue
+    // should read like the reporter's own filesystem. So the expectation has
+    // to be built the same way rather than hardcoding a POSIX separator,
+    // which is what made this fail on Windows only.
+    expect(entry.detail).toContain(join('~', '.dsh', 'profiles', 'web'))
     expect(entry.detail).not.toContain('sk-abcdefgh12345678')
   })
 
