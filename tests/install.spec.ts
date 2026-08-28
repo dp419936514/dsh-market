@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { InstallResult } from '../src/dsh-cli.ts'
@@ -143,6 +143,113 @@ describe('validateAddedPlugins (#18 / #21)', () => {
     const { keep, conflicts } = await validateAddedPlugins(recordingRunner().run, 'web', new Set(['plug-a']))
     expect(keep).toEqual(['plug-b'])
     expect(conflicts).toEqual([])
+  })
+
+  it('drops the bundle row a failed remove already took off disk (#122)', async () => {
+    // pnpm's #65 write-order failure, on the remove side: every persistent
+    // step completes — node_modules unlinked, dependency saved — and the
+    // command still exits 1 (a hoisted-linker file lock aborts the tail).
+    // The plugin command reconciles dsh.profile.bundles only on exit 0, so
+    // the row it leaves behind names a package the next boot cannot
+    // resolve: the whole profile, not just this plugin, refuses to start.
+    const dir = writeProfile({ '@deepseek-ai/dsh-web-app': '^1.0.0', '@scope/dsh-tui': 'github:o/dsh-tui' })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      dependencies: { '@deepseek-ai/dsh-web-app': '^1.0.0', '@scope/dsh-tui': 'github:o/dsh-tui' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-web-app', '@scope/dsh-tui'] } },
+    }))
+    const patch = (id: string, name: string) => `- insert:\n    - id: ${id}\n      name: '${name}'\n`
+    writePkg(dir, '@deepseek-ai/dsh-web-app', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'i.js' }, ['i.js'])
+    writeFileSync(join(dir, 'node_modules', '@deepseek-ai/dsh-web-app', 'cordis.patch.yml'), patch('storage', '@deepseek-ai/dsh-storage'))
+    writePkg(dir, '@scope/dsh-tui', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'i.js' }, ['i.js'])
+    writeFileSync(join(dir, 'node_modules', '@scope/dsh-tui', 'cordis.patch.yml'), patch('storage', '@deepseek-ai/dsh-storage'))
+
+    const calls: string[][] = []
+    const run = (profile: string, args: string[]): Promise<InstallResult> => {
+      calls.push(args)
+      if (args[0] === 'remove') {
+        const manifestFile = join(dir, 'package.json')
+        const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as {
+          dependencies: Record<string, string>
+          dsh?: { profile?: { bundles?: string[] } }
+        }
+        delete manifest.dependencies[args[1]!]
+        writeFileSync(manifestFile, JSON.stringify(manifest, null, 2))
+        rmSync(join(dir, 'node_modules', args[1]!), { recursive: true, force: true })
+        return Promise.resolve({ ...ok, exitCode: 1 })
+      }
+      return Promise.resolve(ok)
+    }
+
+    const { removedBroken } = await validateAddedPlugins(run, 'web', new Set(['@deepseek-ai/dsh-web-app']))
+    expect(removedBroken).toEqual(['@scope/dsh-tui'])
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+      dependencies: Record<string, string>
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(Object.keys(manifest.dependencies)).toEqual(['@deepseek-ai/dsh-web-app'])
+    expect(manifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-web-app'])
+  })
+
+  it('drops the bundle row when a clean-exit remove skipped the manifest reconcile', async () => {
+    // A remove that bypasses the plugin command (raw pnpm in the profile
+    // directory, a drift-recovery install re-run) cleans pnpm's own state
+    // and exits 0, but nothing reconciles dsh.profile.bundles. Disk truth
+    // is the same as the failing case and must land the same way.
+    const dir = writeProfile({ '@deepseek-ai/dsh-web-app': '^1.0.0', '@scope/dsh-tui': 'github:o/dsh-tui' })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      dependencies: { '@deepseek-ai/dsh-web-app': '^1.0.0', '@scope/dsh-tui': 'github:o/dsh-tui' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-web-app', '@scope/dsh-tui'] } },
+    }))
+    const patch = (id: string, name: string) => `- insert:\n    - id: ${id}\n      name: '${name}'\n`
+    writePkg(dir, '@deepseek-ai/dsh-web-app', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'i.js' }, ['i.js'])
+    writeFileSync(join(dir, 'node_modules', '@deepseek-ai/dsh-web-app', 'cordis.patch.yml'), patch('storage', '@deepseek-ai/dsh-storage'))
+    writePkg(dir, '@scope/dsh-tui', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'i.js' }, ['i.js'])
+    writeFileSync(join(dir, 'node_modules', '@scope/dsh-tui', 'cordis.patch.yml'), patch('storage', '@deepseek-ai/dsh-storage'))
+
+    const run = (profile: string, args: string[]): Promise<InstallResult> => {
+      if (args[0] !== 'remove') return Promise.resolve(ok)
+      const manifestFile = join(dir, 'package.json')
+      const manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as {
+        dependencies: Record<string, string>
+      }
+      delete manifest.dependencies[args[1]!]
+      writeFileSync(manifestFile, JSON.stringify(manifest, null, 2))
+      rmSync(join(dir, 'node_modules', args[1]!), { recursive: true, force: true })
+      return Promise.resolve(ok)
+    }
+
+    await validateAddedPlugins(run, 'web', new Set(['@deepseek-ai/dsh-web-app']))
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(manifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-web-app'])
+  })
+
+  it('keeps the manifest rows of a failed remove whose package is still on disk', async () => {
+    // The other half of disk truth: a remove that failed BEFORE deleting
+    // anything leaves an intact installation. Dropping the rows here would
+    // orphan a dependency the profile can still load; a retry needs them.
+    const dir = writeProfile({ '@deepseek-ai/dsh-web-app': '^1.0.0', '@scope/dsh-tui': 'github:o/dsh-tui' })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      dependencies: { '@deepseek-ai/dsh-web-app': '^1.0.0', '@scope/dsh-tui': 'github:o/dsh-tui' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-web-app', '@scope/dsh-tui'] } },
+    }))
+    const patch = (id: string, name: string) => `- insert:\n    - id: ${id}\n      name: '${name}'\n`
+    writePkg(dir, '@deepseek-ai/dsh-web-app', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'i.js' }, ['i.js'])
+    writeFileSync(join(dir, 'node_modules', '@deepseek-ai/dsh-web-app', 'cordis.patch.yml'), patch('storage', '@deepseek-ai/dsh-storage'))
+    writePkg(dir, '@scope/dsh-tui', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'i.js' }, ['i.js'])
+    writeFileSync(join(dir, 'node_modules', '@scope/dsh-tui', 'cordis.patch.yml'), patch('storage', '@deepseek-ai/dsh-storage'))
+
+    const run = (_profile: string, args: string[]): Promise<InstallResult> =>
+      Promise.resolve(args[0] === 'remove' ? { ...ok, exitCode: 1 } : ok)
+
+    await validateAddedPlugins(run, 'web', new Set(['@deepseek-ai/dsh-web-app']))
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+      dependencies: Record<string, string>
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(manifest.dependencies['@scope/dsh-tui']).toBe('github:o/dsh-tui')
+    expect(manifest.dsh.profile.bundles).toContain('@scope/dsh-tui')
   })
 
   it('groups clash hits by the installed plugin that owns them', () => {

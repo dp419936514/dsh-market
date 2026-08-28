@@ -9,7 +9,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { InstallResult, PluginRunner } from './dsh-cli.ts'
 import { classifyPnpmFailure, HOST_NAMESPACE_RE, isTransientPnpmFailure } from './pnpm-compat.ts'
-import { conflictingEntryIds, hasDshManifest, hasLoadableEntry, pluginSubdirs, profileDir, readInstalled, readManifestDeps, readProfileBundles } from './profile.ts'
+import { conflictingEntryIds, dropFromManifest, hasDshManifest, hasLoadableEntry, pluginSubdirs, profileDir, readInstalled, readManifestDeps, readProfileBundles } from './profile.ts'
 import { logEvent } from './log.ts'
 import { cleanOrphanedStore } from './store.ts'
 
@@ -261,7 +261,7 @@ export async function validateAddedPlugins(
     // ship no entry of their own (#103) and must not be uninstalled here.
     if (!hasDshManifest(packageDir) || !hasLoadableEntry(dir, n)) {
       removedBroken.push(n)
-      await run(profile, ['remove', n])
+      await removeAndReconcile(run, profile, dir, n)
       continue
     }
     const clash = conflictingEntryIds(dir, n, existingBundles)
@@ -271,12 +271,47 @@ export async function validateAddedPlugins(
       removedBroken.push(n)
       logEvent('error', 'install',
         `${n}: loader entry id conflict with ${clash[0].owner} (${clash.map(hit => hit.id).join(', ')}) — removing, it would break the next boot`)
-      await run(profile, ['remove', n])
+      await removeAndReconcile(run, profile, dir, n)
       continue
     }
     keep.push(n)
   }
   return { added: addedNow, keep, removedBroken, conflicts }
+}
+
+/**
+ * Run one removal this validation triggered and reconcile the manifest by
+ * disk truth afterwards.
+ *
+ * The plugin command reconciles `dsh.profile.bundles` only when pnpm exits
+ * 0, and a remove can fail AFTER completing every persistent step — the #65
+ * write-order family — or exit 0 with the reconcile still not reflected in
+ * the manifest. Either way the bundle row left behind names a package the
+ * next boot cannot resolve, and the loader dies on the first such row: the
+ * whole profile, not just this plugin, refuses to start, with the market's
+ * own page unreachable. Disk truth decides the repair, deliberately: a
+ * package that is gone gets its manifest rows dropped so the boot stays
+ * loadable, while a package still on disk keeps them, because a retry needs
+ * something to retry against.
+ * @param run - the plugin runner, as the caller received it.
+ * @param profile - the profile name for manifest writes.
+ * @param dir - the profile directory the validation reads.
+ * @param name - the package being removed.
+ */
+async function removeAndReconcile(run: PluginRunner, profile: string, dir: string, name: string): Promise<void> {
+  const result = await run(profile, ['remove', name])
+  const gone = !existsSync(join(dir, 'node_modules', name, 'package.json'))
+  if (gone) {
+    if (dropFromManifest(profile, name, dir)) {
+      logEvent('error', 'install',
+        `${name}: remove ${result.exitCode === 0 ? 'skipped the manifest reconcile' : `failed (exit ${String(result.exitCode)})`} but the package is gone from disk — dropped its dependency/bundle rows so the next boot stays loadable`)
+    }
+    return
+  }
+  if (result.exitCode !== 0 || result.timedOut || result.cancelled) {
+    logEvent('error', 'install',
+      `${name}: remove failed (exit ${String(result.exitCode)})${result.timedOut ? ' timed out' : ''}${result.cancelled ? ' cancelled' : ''} and the package is still installed — its rows stay in the manifest; retry the uninstall`)
+  }
 }
 
 /**

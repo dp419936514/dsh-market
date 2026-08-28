@@ -18,7 +18,7 @@ import {
   mountClientOnlyDeps, purgeMarketState, readMarketState, writeMarketState,
 } from './hot.ts'
 import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
-import { exportLogs, logEvent } from './log.ts'
+import { configurePersistentLog, exportLogs, logEvent, readPersistentLog } from './log.ts'
 import { marketFetch } from './net.ts'
 import { diagnosePackageManifests } from './diagnostics.ts'
 import {
@@ -197,6 +197,8 @@ export function mountMarketRoutes(
     throw new Error(message)
   }
   const activeProfileDir = profileDir(config.profile, config.profileDirectory)
+  const persistentLogFile = join(activeProfileDir, '.dsh-market', 'log.ndjson')
+  configurePersistentLog(persistentLogFile)
   let agentGuardUnavailableLogged = false
   /** Running-agent ids for the mutation gate; logs once when the host exposes no agents service. */
   const runningAgentsForGuard = (): string[] => {
@@ -1925,7 +1927,7 @@ export function mountMarketRoutes(
           platform: `${process.platform} ${process.arch}`,
           node: process.version,
           profile: config.profile,
-        }, snapshot))
+        }, snapshot, readPersistentLog(persistentLogFile)))
       },
     }),
 
@@ -3368,6 +3370,7 @@ export function mountMarketRoutes(
   ]
 
   return () => {
+    configurePersistentLog(null)
     for (const dispose of disposers) dispose()
   }
 }
