@@ -4,7 +4,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { configurePersistentLog, exportLogs, logEvent, readPersistentLog } from '../src/log.ts'
@@ -38,6 +38,20 @@ describe('persistent log sink', () => {
     const trimmed = readFileSync(logFile, 'utf8')
     expect(trimmed.length).toBeLessThanOrEqual(128 * 1024 + 128)
     expect(trimmed.endsWith('x\n')).toBe(true)
+  })
+
+  it('holds the cap while the process keeps running, not only at mount', () => {
+    // Trimming only on configure left the ceiling unenforced for the life of
+    // a process. Measured before the fix: 20k events grew the file to 3.2 MB.
+    // A retry loop is precisely the case that logs hardest and never restarts,
+    // so the process that most needs this log is the one that would blow it up.
+    configurePersistentLog(logFile)
+    for (let i = 0; i < 6000; i++) logEvent('error', 'install', `${'x'.repeat(120)} ${i}`)
+    expect(statSync(logFile).size).toBeLessThanOrEqual(256 * 1024)
+    // Still usable, and still holding the NEWEST events rather than the oldest.
+    const lines = readPersistentLog(logFile)
+    expect(lines.length).toBeGreaterThan(0)
+    expect(JSON.parse(lines[lines.length - 1]!).detail).toContain('5999')
   })
 
   it('keeps exportLogs readable with and without prior sessions', () => {

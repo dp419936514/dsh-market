@@ -31,6 +31,8 @@ const PERSISTENT_MAX_BYTES = 256 * 1024
 
 const entries: LogEntry[] = []
 let persistentFile: string | null = null
+/** Bytes in the sink file, tracked so the cap holds without a stat per event. */
+let persistentBytes = 0
 
 function sanitize(text: string): string {
   return text
@@ -65,13 +67,36 @@ export function logEvent(level: LogLevel, event: string, detail: string): void {
   if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES)
   if (persistentFile === null) return
   try {
-    appendFileSync(persistentFile, `${JSON.stringify(entry)}\n`)
+    const line = `${JSON.stringify(entry)}\n`
+    appendFileSync(persistentFile, line)
+    persistentBytes += line.length
+    // Trimming only on mount left the cap unenforced for the life of a
+    // process: 20k events grew the file to 3.2 MB in a measurement, and a
+    // retry loop is exactly the situation that both logs hardest and never
+    // restarts. Re-trim in place once the ceiling is crossed.
+    if (persistentBytes > PERSISTENT_MAX_BYTES) trimPersistentLog(persistentFile)
   } catch {
     // Only append failures reach this: a read-only or full disk. The
     // in-memory log still serves this session's export; persistence
     // disables itself so one bad write cannot break every future event.
     persistentFile = null
   }
+}
+
+/**
+ * Rewrite the sink keeping only its newest half, and resync the byte count.
+ * @param file - the sink file to trim in place.
+ */
+function trimPersistentLog(file: string): void {
+  const lines = readFileSync(file, 'utf8').split('\n').filter(line => line !== '')
+  const kept: string[] = []
+  let bytes = 0
+  for (let index = lines.length - 1; index >= 0 && bytes <= PERSISTENT_MAX_BYTES / 2; index -= 1) {
+    kept.unshift(`${lines[index]!}\n`)
+    bytes += lines[index]!.length + 1
+  }
+  writeFileSync(file, kept.join(''))
+  persistentBytes = bytes
 }
 
 /**
@@ -87,15 +112,9 @@ export function configurePersistentLog(file: string | null): void {
   if (file === null) return
   try {
     mkdirSync(dirname(file), { recursive: true })
-    if (!existsSync(file) || statSync(file).size <= PERSISTENT_MAX_BYTES) return
-    const lines = readFileSync(file, 'utf8').split('\n').filter(line => line !== '')
-    let kept: string[] = []
-    let bytes = 0
-    for (let index = lines.length - 1; index >= 0 && bytes <= PERSISTENT_MAX_BYTES / 2; index -= 1) {
-      kept.unshift(`${lines[index]!}\n`)
-      bytes += lines[index]!.length + 1
-    }
-    writeFileSync(file, kept.join(''))
+    persistentBytes = existsSync(file) ? statSync(file).size : 0
+    if (persistentBytes <= PERSISTENT_MAX_BYTES) return
+    trimPersistentLog(file)
   } catch {
     // Only configure-time filesystem failures reach this (the directory
     // cannot be created, the file cannot be read or rewritten). The market
